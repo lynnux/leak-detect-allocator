@@ -1,14 +1,15 @@
 ## Idea
 It's hard to detect memory leak, with a global allocator, we can trace the `alloc` add `dealloc`, if we record the call stacks of `alloc` operation, then we can see where the code lead memory leak. This tool do NOT record ALL allocation, but delete the record when `dealloc`.
+
 Powerd by `global allocator` + `heapless` + `backtrace`, it's only support nightly toolchain, caused by `new_uninit` and `const_fn` features.
 
 ## Usage
 Add this to your cargo.toml:
-```
+```toml
 leak-detect-allocator = {git = "https://github.com/lynnux/leak-detect-allocator.git"}
 ```
 Example:
-```
+```rust
 #[global_allocator]
 static LEAK_TRACER: LeakTracerDefault = LeakTracerDefault::new();
 
@@ -68,8 +69,9 @@ leak memory address: 0x4508c0, size: 30
 	alloc::slice::hack::to_vec<u8>
 	...
 ```
+Stack calls seems better in debug version.
 ## Customize
-```
+```rust
 	// change the vec size to bigger, so we can save more call stack
         use crate::{
             consts, ArrayLength, FnvIndexMap, HeaplessVec, LeakData, LeakDataTrait, LeakTracer,
