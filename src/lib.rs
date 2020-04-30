@@ -1,154 +1,141 @@
 #![feature(new_uninit)]
 #![feature(const_fn)]
 
-pub use heapless::consts;
-use heapless::{consts::*, ArrayLength, FnvIndexMap};
+pub use heapless::{consts, ArrayLength, FnvIndexMap, Vec as HeaplessVec};
 use once_cell::sync::OnceCell;
 use spin::Mutex;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    marker::PhantomData,
+};
 
-//type FixedMap = FnvIndexMap<usize, FixedVec, U32768>;
-//type FixedVec = heapless::Vec<usize, U10>;
-
-//static TRACE_ACTIVATE: AtomicBool = AtomicBool::new(false);
-//static ALLOC_MAP: OnceCell<Mutex<Box<FixedMap>>> = OnceCell::new();
-
-pub struct LeakTracer<VN>
+pub struct LeakTracer<LDT, VN>
 where
     VN: ArrayLength<usize>,
+    LDT: LeakDataTrait<VN>,
 {
-    TRACE_ACTIVATE: AtomicBool,
-    ALLOC_MAP: OnceCell<Mutex<Box<FnvIndexMap<usize, heapless::Vec<usize, VN>, U32768>>>>,
+    leak_data: OnceCell<Mutex<Box<LDT>>>,
+    phantom: PhantomData<VN>,
 }
 
-type LeakTracerDefault = LeakTracer<U10>;
-impl<VN> LeakTracer<VN>
-where
-    VN: ArrayLength<usize>,
-{
-    const fn new() -> Self
+pub type LeakTracerDefault = LeakTracer<LeakData<consts::U10>, consts::U10>;
+
+pub trait LeakDataTrait<VN: ArrayLength<usize>> {
+    fn insert(&mut self, key: usize, value: HeaplessVec<usize, VN>);
+    fn contains_key(&self, key: usize) -> bool;
+    fn remove(&mut self, key: usize);
+    fn iter_all<F>(&self, f: F)
     where
-        VN: ArrayLength<usize>,
+        F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool;
+}
+
+pub struct LeakData<VN: ArrayLength<usize>> {
+    inner: FnvIndexMap<usize, HeaplessVec<usize, VN>, consts::U32768>,
+}
+impl<VN: ArrayLength<usize>> LeakDataTrait<VN> for LeakData<VN> {
+    fn insert(&mut self, key: usize, value: HeaplessVec<usize, VN>) {
+        self.inner.insert(key, value).ok();
+    }
+    fn contains_key(&self, key: usize) -> bool {
+        self.inner.contains_key(&key)
+    }
+    fn remove(&mut self, key: usize) {
+        self.inner.remove(&key);
+    }
+    fn iter_all<F>(&self, mut f: F)
+    where
+        F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool,
     {
-        LeakTracer::<VN> {
-            TRACE_ACTIVATE: AtomicBool::new(false),
-            ALLOC_MAP: OnceCell::new(),
+        for (addr, symbol_address) in self.inner.iter() {
+            if !f(*addr, symbol_address) {
+                break;
+            }
         }
     }
-    fn new_map() -> Box<FnvIndexMap<usize, heapless::Vec<usize, VN>, U32768>>
-    where
-        VN: ArrayLength<usize>,
-    {
-        let alloc_on_heap =
-            Box::<FnvIndexMap<usize, heapless::Vec<usize, VN>, U32768>>::new_zeroed();
+}
+
+impl<VN: ArrayLength<usize>> LeakData<VN> {}
+impl<LDT, VN> LeakTracer<LDT, VN>
+where
+    VN: ArrayLength<usize>,
+    LDT: LeakDataTrait<VN>,
+{
+    //pub const fn test(){    }
+    pub const fn new() -> Self {
+        LeakTracer {
+            leak_data: OnceCell::new(),
+            phantom: PhantomData,
+        }
+    }
+
+    fn new_data() -> Box<LDT> {
+        let alloc_on_heap = Box::<LDT>::new_zeroed();
         unsafe { alloc_on_heap.assume_init() }
     }
-    pub fn init(&self)
-    where
-        VN: ArrayLength<usize>,
-    {
-        //use std::mem::size_of;
-        //println!("size: {}", size_of::<FixedMap>());
-        self.ALLOC_MAP.set(Mutex::new(Self::new_map())).unwrap();
-        self.TRACE_ACTIVATE.store(true, Ordering::Relaxed);
+    pub fn init(&self) -> usize {
+        self.leak_data.set(Mutex::new(Self::new_data())).ok();
+        std::mem::size_of::<LDT>()
     }
 
-    pub fn alived(&self)
+    pub fn now_leaks<F>(&self, f: F)
     where
-        VN: ArrayLength<usize>,
+        F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool,
     {
-        let mut cloned = Self::new_map();
-        {
-            let x = self.ALLOC_MAP.get().unwrap().lock();
-            //cloned = .map(|a, s|(*a, s.clone())).collect();
-            for (addr, symbol_address) in (*x).iter() {
-                cloned.insert(*addr, symbol_address.clone()).ok();
-            }
-        }
-        let mut out = String::new();
-        let mut count = 0;
-        for (addr, symbol_address) in cloned.iter() {
-            let mut it = symbol_address.into_iter();
-            count += 1;
-            out += &format!(
-                "leak memory address: {:#x}, size: {}\r\n",
-                addr,
-                it.next().unwrap_or(&0)
-            );
-            for s in it {
-                let ss: usize = *s;
-                // Resolve this instruction pointer to a symbol name
-                unsafe {
-                    backtrace::resolve_unsynchronized(ss as *mut _, |symbol| {
-                        if let Some(name) = symbol.name() {
-                            out += &format!("\t{}\r\n", name);
-                        }
-                    });
-                }
-            }
-        }
-        out += &format!("total count:{}\r\n", count);
-
-        std::fs::write("foo.txt", out.as_str().as_bytes()).ok();
+        let all = self.alive_now();
+        all.iter_all(f);
     }
-    pub fn uninit(&self)
-    where
-        VN: ArrayLength<usize>,
-    {
-        self.TRACE_ACTIVATE.store(false, Ordering::Relaxed);
+
+    pub unsafe fn get_symbol_name(&self, addr: usize) -> Option<String>{
+        let mut ret : Option<String> = None;
+        backtrace::resolve_unsynchronized(addr as *mut _, |symbol| {
+                ret = symbol.name().map(|x|x.to_string())
+        });
+        ret
+    }
+
+    fn alive_now(&self) -> Box<LDT> {
+        let mut cloned = Self::new_data();
+        if let Some(data) = self.leak_data.get() {
+            let x = data.lock();
+            (*x).iter_all(|addr, vec| {
+                cloned.insert(addr, vec.clone());
+                true
+            });
+        }
+        cloned
     }
 }
 
-unsafe impl<VN> GlobalAlloc for LeakTracer<VN>
+unsafe impl<LDT, VN> GlobalAlloc for LeakTracer<LDT, VN>
 where
     VN: ArrayLength<usize>,
+    LDT: LeakDataTrait<VN>,
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
         let ptr = System.alloc(layout);
-
-        if self.TRACE_ACTIVATE.load(Ordering::Relaxed) {
-            let mut x = self.ALLOC_MAP.get().unwrap().lock();
-
-            // we only save 10 symbol addresses.
-            let mut v = heapless::Vec::new();
+        if let Some(data) = self.leak_data.get() {
+            let mut x = data.lock();
+            let mut v = HeaplessVec::new();
             v.push(size).ok(); // first is size
-            let mut count = 0;
             backtrace::trace_unsynchronized(|frame| {
-                count += 1;
-
-                //let ip = frame.ip();
-                // skip 2 frame
-                if count < 3 {
-                    return true;
-                }
                 let symbol_address = frame.symbol_address();
-                v.push(symbol_address as usize).ok();
-
-                if count < 11 {
-                    true // going to the next frame
-                } else {
-                    false
-                }
+                v.push(symbol_address as usize).is_ok()
             });
-            x.insert(ptr as usize, v).ok();
+            x.insert(ptr as usize, v);
         }
-
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if self.TRACE_ACTIVATE.load(Ordering::Relaxed) {
-            let mut x = self.ALLOC_MAP.get().unwrap().lock();
-            if !x.contains_key(&(ptr as usize)) {
-                println!("got missed {}", ptr as usize);
-            //println!("{:?}", x);
+        if let Some(data) = self.leak_data.get() {
+            let mut x = data.lock();
+            if !x.contains_key(ptr as usize) {
+                //println!("got missed {}", ptr as usize);
             } else {
-                x.remove(&(ptr as usize));
+                x.remove(ptr as usize);
             }
         }
-
         System.dealloc(ptr, layout);
     }
 }
@@ -157,6 +144,37 @@ where
 mod tests {
     #[test]
     fn it_works() {
-        assert_eq!(2 + 2, 4);
+        use crate::{
+            consts, ArrayLength, FnvIndexMap, HeaplessVec, LeakData, LeakDataTrait, LeakTracer,
+        };
+        let aa = LeakTracer::<LeakData<consts::U10>, _>::new();
+        println!("size: {}", aa.init());
+
+        struct CustomData<VN: ArrayLength<usize>> {
+            inner: FnvIndexMap<usize, HeaplessVec<usize, VN>, consts::U16384>, // --> U16384 is customized
+        }
+        impl<VN: ArrayLength<usize>> LeakDataTrait<VN> for CustomData<VN> {
+            fn insert(&mut self, key: usize, value: HeaplessVec<usize, VN>) {
+                self.inner.insert(key, value).ok();
+            }
+            fn contains_key(&self, key: usize) -> bool {
+                self.inner.contains_key(&key)
+            }
+            fn remove(&mut self, key: usize) {
+                self.inner.remove(&key);
+            }
+            fn iter_all<F>(&self, mut f: F)
+            where
+                F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool,
+            {
+                for (addr, symbol_address) in self.inner.iter() {
+                    if !f(*addr, symbol_address) {
+                        break;
+                    }
+                }
+            }
+        }
+        let bb = LeakTracer::<CustomData<consts::U12>, _>::new();
+        println!("size: {}", bb.init());
     }
 }
