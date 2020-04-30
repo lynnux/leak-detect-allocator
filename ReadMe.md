@@ -16,30 +16,34 @@ static LEAK_TRACER: LeakTracerDefault = LeakTracerDefault::new();
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let lda_size = LEAK_TRACER.init();
-    tokio::spawn(async {
+    tokio::spawn(async move {
         loop {
             tokio::signal::ctrl_c().await.ok();
-			
             let mut out = String::new();
             let mut count = 0;
-            LEAK_TRACER.now_leaks(|addr, frames|{
+            let mut count_size = 0;
+            LEAK_TRACER.now_leaks(|addr, frames| {
                 count += 1;
                 let mut it = frames.iter();
                 // first is the alloc size
-                out += &format!(
-                    "leak memory address: {:#x}, size: {}\r\n",
-                    addr,
-                    it.next().unwrap_or(&0)
-                );
+                let size = it.next().unwrap_or(&0);
+                if *size == lda_size {
+                    return true;
+                }
+                count_size += size;
+                out += &format!("leak memory address: {:#x}, size: {}\r\n", addr, size);
                 for f in it {
                     // Resolve this instruction pointer to a symbol name
                     unsafe {
-                        out += &format!("\t{}\r\n", LEAK_TRACER.get_symbol_name(*f).unwrap_or("".to_owned()));
+                        out += &format!(
+                            "\t{}\r\n",
+                            LEAK_TRACER.get_symbol_name(*f).unwrap_or("".to_owned())
+                        );
                     }
                 }
-                true  // continue until end
+                true // continue until end
             });
-            out += &format!("total count:{}\r\n", count);
+            out += &format!("\r\ntotal address:{}, bytes:{}, internal use for leak-detect-allacator:{} bytes\r\n", count, count_size, lda_size*2);
             std::fs::write("foo.txt", out.as_str().as_bytes()).ok();
         }
     });
@@ -68,6 +72,7 @@ leak memory address: 0x4508c0, size: 30
 	alloc::vec::Vec<u8>::with_capacity<u8>
 	alloc::slice::hack::to_vec<u8>
 	...
+total address:38, bytes:6373, internal use for leak-detect-allacator:7077904 bytes	
 ```
 Stack calls seems better in debug version.
 ## Customize
