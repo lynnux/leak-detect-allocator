@@ -3,6 +3,9 @@ name = "leak-detect-allocator"
 version = "0.1.0"
 authors = ["lynnux <lynnux@qq.com>"]
 edition = "2018"
+license = "MIT"
+description = "Memory leak detector for nightly toolchain"
+repository = "https://github.com/lynnux/leak-detect-allocator"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

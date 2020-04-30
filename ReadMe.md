@@ -1,3 +1,7 @@
+## Idea
+It's hard to detect memory leak, with a global allocator, we can trace the `alloc` add `dealloc`, if we record the call stacks of `alloc` operation, then we can see where the code lead memory leak. This tool do NOT record ALL allocation, but delete the record when `dealloc`.
+Powerd by `global allocator` + `heapless` + `backtrace`, it's only support nightly toolchain, caused by `new_uninit` and `const_fn` features.
+
 ## Usage
 Add this to your cargo.toml:
 ```
@@ -66,7 +70,7 @@ leak memory address: 0x4508c0, size: 30
 ```
 ## Customize
 ```
-	// change the vec size to bigger, so we can get more stack address
+	// change the vec size to bigger, so we can save more call stack
         use crate::{
             consts, ArrayLength, FnvIndexMap, HeaplessVec, LeakData, LeakDataTrait, LeakTracer,
         };
@@ -74,7 +78,7 @@ leak memory address: 0x4508c0, size: 30
         println!("size: {}", aa.init());
 		
 		
-	// change the whole indexmap size, so we get more splace to save
+	// change the whole indexmap size, so we get more space to save
 	struct CustomData<VN: ArrayLength<usize>> {
             inner: FnvIndexMap<usize, HeaplessVec<usize, VN>, consts::U16384>, // --> U16384 is customized
         }
