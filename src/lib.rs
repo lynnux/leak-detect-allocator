@@ -1,6 +1,7 @@
 #![feature(new_uninit)]
 #![feature(const_fn)]
 
+use heapless::String as HeaplessString;
 pub use heapless::{consts, ArrayLength, FnvIndexMap, Vec as HeaplessVec};
 use once_cell::sync::OnceCell;
 use spin::Mutex;
@@ -15,6 +16,7 @@ where
     LDT: LeakDataTrait<VN>,
 {
     leak_data: OnceCell<Mutex<Box<LDT>>>,
+    backtrace_lock: OnceCell<Mutex<()>>,
     phantom: PhantomData<VN>,
 }
 
@@ -60,10 +62,10 @@ where
     VN: ArrayLength<usize>,
     LDT: LeakDataTrait<VN>,
 {
-    //pub const fn test(){    }
     pub const fn new() -> Self {
         LeakTracer {
             leak_data: OnceCell::new(),
+            backtrace_lock: OnceCell::new(),
             phantom: PhantomData,
         }
     }
@@ -74,6 +76,7 @@ where
     }
     pub fn init(&self) -> usize {
         self.leak_data.set(Mutex::new(Self::new_data())).ok();
+        self.backtrace_lock.set(Mutex::new(())).ok();
         std::mem::size_of::<LDT>()
     }
 
@@ -85,11 +88,32 @@ where
         all.iter_all(f);
     }
 
-    pub unsafe fn get_symbol_name(&self, addr: usize) -> Option<String>{
-        let mut ret : Option<String> = None;
-        backtrace::resolve_unsynchronized(addr as *mut _, |symbol| {
-                ret = symbol.name().map(|x|x.to_string())
-        });
+    pub unsafe fn get_symbol_name(&self, addr: usize) -> Option<String> {
+        let mut ret: Option<String> = None;
+        if let Some(locker) = self.backtrace_lock.get() {
+            let mut symbol_buf = {
+                // some symbol name really long, so alloc 500 bytes to hold
+                let alloc_on_heap = Box::<HeaplessString<consts::U500>>::new_zeroed();
+                alloc_on_heap.assume_init()
+            };
+            let mut got = false;
+            let l = locker.lock();
+            backtrace::resolve_unsynchronized(addr as *mut _, |symbol| {
+                // do NOT trigger alloc in closure scope!
+                match symbol.name() {
+                    Some(x) => {
+                        use std::fmt::Write;
+                        write!(&mut symbol_buf, "{}", x).ok();
+                        got = true;
+                    }
+                    _ => {}
+                }
+            });
+            drop(l);
+            if got {
+                ret = Some(symbol_buf.as_str().to_owned());
+            }
+        }
         ret
     }
 
@@ -118,10 +142,14 @@ where
             let mut x = data.lock();
             let mut v = HeaplessVec::new();
             v.push(size).ok(); // first is size
-            backtrace::trace_unsynchronized(|frame| {
-                let symbol_address = frame.symbol_address();
-                v.push(symbol_address as usize).is_ok()
-            });
+            if let Some(locker) = self.backtrace_lock.get() {
+                let l = locker.lock();
+                backtrace::trace_unsynchronized(|frame| {
+                    let symbol_address = frame.symbol_address();
+                    v.push(symbol_address as usize).is_ok()
+                });
+                drop(l);
+            }
             x.insert(ptr as usize, v);
         }
         ptr
