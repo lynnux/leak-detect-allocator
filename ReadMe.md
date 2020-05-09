@@ -113,3 +113,6 @@ Stack calls seems better in debug version.
         let bb = LeakTracer::<CustomData<consts::U12>, _>::new();
         println!("size: {}", bb.init());
 ```
+
+## Known Issues
+On Win7 64, if you encounter deadlock, you can try place a newer version of dbghelp.dll to your bin directory.
