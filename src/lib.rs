@@ -16,7 +16,7 @@ where
     LDT: LeakDataTrait<VN>,
 {
     leak_data: OnceCell<Mutex<Box<LDT>>>,
-    backtrace_lock: OnceCell<Mutex<()>>,
+    backtrace_lock: OnceCell<Mutex<()>>, // we can't use backtrace internal locker, cause it need "std" feature which are not allowed
     phantom: PhantomData<VN>,
 }
 
@@ -144,6 +144,7 @@ where
             v.push(size).ok(); // first is size
             if let Some(locker) = self.backtrace_lock.get() {
                 let l = locker.lock();
+                // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
                 backtrace::trace_unsynchronized(|frame| {
                     let symbol_address = frame.symbol_address();
                     v.push(symbol_address as usize).is_ok()
