@@ -138,20 +138,26 @@ where
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
         let ptr = System.alloc(layout);
+        let locker = if let Some(locker) = self.backtrace_lock.get() {
+            locker
+        } else {
+            return ptr;
+        };
+        let mut v = HeaplessVec::new();
+        v.push(size).ok(); // first is size
+        let l = if cfg!(os = "windows") {
+            Some(locker.lock())
+        } else {
+            None
+        };
+        // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
+        backtrace::trace_unsynchronized(|frame| {
+            let symbol_address = frame.ip();
+            v.push(symbol_address as usize).is_ok()
+        });
+        drop(l);
         if let Some(data) = self.leak_data.get() {
-            let mut x = data.lock();
-            let mut v = HeaplessVec::new();
-            v.push(size).ok(); // first is size
-            if let Some(locker) = self.backtrace_lock.get() {
-                let l = locker.lock();
-                // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
-                backtrace::trace_unsynchronized(|frame| {
-                    let symbol_address = frame.ip();
-                    v.push(symbol_address as usize).is_ok()
-                });
-                drop(l);
-            }
-            x.insert(ptr as usize, v);
+            data.lock().insert(ptr as usize, v);
         }
         ptr
     }
