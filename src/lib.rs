@@ -129,8 +129,7 @@ where
         cloned
     }
 
-    unsafe fn alloc_accounting(&self, layout: Layout, ptr: *mut u8) -> *mut u8 {
-        let size = layout.size();
+    fn alloc_accounting(&self, size: usize, ptr: *mut u8) -> *mut u8 {
         let locker = if let Some(locker) = self.backtrace_lock.get() {
             locker
         } else {
@@ -144,10 +143,12 @@ where
             None
         };
         // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
-        backtrace::trace_unsynchronized(|frame| {
-            let symbol_address = frame.ip();
-            v.push(symbol_address as usize).is_ok()
-        });
+        unsafe {
+            backtrace::trace_unsynchronized(|frame| {
+                let symbol_address = frame.ip();
+                v.push(symbol_address as usize).is_ok()
+            });
+        }
         drop(l);
         if let Some(data) = self.leak_data.get() {
             data.lock().insert(ptr as usize, v);
@@ -155,7 +156,7 @@ where
         ptr
     }
 
-    unsafe fn dealloc_accounting(&self, ptr: *mut u8) {
+    fn dealloc_accounting(&self, ptr: *mut u8) {
         if let Some(data) = self.leak_data.get() {
             let mut x = data.lock();
             if !x.contains_key(ptr as usize) {
@@ -173,7 +174,7 @@ where
     LDT: LeakDataTrait<VN>,
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.alloc_accounting(layout, System.alloc(layout))
+        self.alloc_accounting(layout.size(), System.alloc(layout))
     }
 
     unsafe fn realloc(
@@ -185,7 +186,7 @@ where
         let ptr = System.realloc(ptr0, layout, new_size);
         if ptr != ptr0 {
             self.dealloc_accounting(ptr0);
-            self.alloc_accounting(layout, ptr);
+            self.alloc_accounting(new_size, ptr);
         }
         ptr
     }
