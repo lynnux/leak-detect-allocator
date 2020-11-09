@@ -146,7 +146,7 @@ where
                 let l = locker.lock();
                 // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
                 backtrace::trace_unsynchronized(|frame| {
-                    let symbol_address = frame.symbol_address();
+                    let symbol_address = frame.ip();
                     v.push(symbol_address as usize).is_ok()
                 });
                 drop(l);
