@@ -128,35 +128,35 @@ where
         }
         cloned
     }
-}
 
-unsafe impl<LDT, VN> GlobalAlloc for LeakTracer<LDT, VN>
-where
-    VN: ArrayLength<usize>,
-    LDT: LeakDataTrait<VN>,
-{
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size();
-        let ptr = System.alloc(layout);
+    fn alloc_accounting(&self, size: usize, ptr: *mut u8) -> *mut u8 {
+        let locker = if let Some(locker) = self.backtrace_lock.get() {
+            locker
+        } else {
+            return ptr;
+        };
+        let mut v = HeaplessVec::new();
+        v.push(size).ok(); // first is size
+        let l = if cfg!(os = "windows") {
+            Some(locker.lock())
+        } else {
+            None
+        };
+        // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
+        unsafe {
+            backtrace::trace_unsynchronized(|frame| {
+                let symbol_address = frame.ip();
+                v.push(symbol_address as usize).is_ok()
+            });
+        }
+        drop(l);
         if let Some(data) = self.leak_data.get() {
-            let mut x = data.lock();
-            let mut v = HeaplessVec::new();
-            v.push(size).ok(); // first is size
-            if let Some(locker) = self.backtrace_lock.get() {
-                let l = locker.lock();
-                // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
-                backtrace::trace_unsynchronized(|frame| {
-                    let symbol_address = frame.ip();
-                    v.push(symbol_address as usize).is_ok()
-                });
-                drop(l);
-            }
-            x.insert(ptr as usize, v);
+            data.lock().insert(ptr as usize, v);
         }
         ptr
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    fn dealloc_accounting(&self, ptr: *mut u8) {
         if let Some(data) = self.leak_data.get() {
             let mut x = data.lock();
             if !x.contains_key(ptr as usize) {
@@ -165,6 +165,34 @@ where
                 x.remove(ptr as usize);
             }
         }
+    }
+}
+
+unsafe impl<LDT, VN> GlobalAlloc for LeakTracer<LDT, VN>
+where
+    VN: ArrayLength<usize>,
+    LDT: LeakDataTrait<VN>,
+{
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.alloc_accounting(layout.size(), System.alloc(layout))
+    }
+
+    unsafe fn realloc(
+        &self,
+        ptr0: *mut u8,
+        layout: Layout,
+        new_size: usize
+    ) -> *mut u8 {
+        let ptr = System.realloc(ptr0, layout, new_size);
+        if ptr != ptr0 {
+            self.dealloc_accounting(ptr0);
+            self.alloc_accounting(new_size, ptr);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.dealloc_accounting(ptr);
         System.dealloc(ptr, layout);
     }
 }
