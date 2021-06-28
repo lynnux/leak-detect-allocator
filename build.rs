@@ -5,7 +5,8 @@ fn main() {
     build
         .cpp(true)
         .flag_if_supported("/std:c++11")
-        .flag_if_supported("-w");
+        .flag_if_supported("-w").opt_level(2)
+        ;
 
     println!("cargo:rerun-if-changed=src/alloc_internal.cpp");
     build.file("src/alloc_internal.cpp");
