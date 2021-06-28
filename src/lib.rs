@@ -1,114 +1,96 @@
 #![feature(new_uninit)]
-#![feature(const_fn)]
-
 use heapless::String as HeaplessString;
-pub use heapless::{consts, ArrayLength, FnvIndexMap, Vec as HeaplessVec};
 use once_cell::sync::OnceCell;
 use spin::Mutex;
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    marker::PhantomData,
-};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::ffi::c_void;
 
-pub struct LeakTracer<LDT, VN>
-where
-    VN: ArrayLength<usize>,
-    LDT: LeakDataTrait<VN>,
-{
-    leak_data: OnceCell<Mutex<Box<LDT>>>,
+type EnumProc = unsafe extern "C" fn(
+    usr_data: *const c_void,
+    address: usize,
+    size: usize,
+    stack: *const usize,
+) -> i32;
+
+extern "C" {
+    fn alloc_internal_init(stack_size: usize);
+    fn alloc_internal_alloc(address: usize, size: usize, stack: *const usize);
+    fn alloc_internal_dealloc(address: usize);
+    fn alloc_enum(usr_data: *const c_void, cb: EnumProc);
+}
+
+pub struct LeakTracer<const STACK_SIZE: usize> {
     backtrace_lock: OnceCell<Mutex<()>>, // we can't use backtrace internal locker, cause it need "std" feature which are not allowed
-    phantom: PhantomData<VN>,
 }
 
-pub type LeakTracerDefault = LeakTracer<LeakData<consts::U10>, consts::U10>;
+pub type LeakTracerDefault = LeakTracer<10>;
 
-pub trait LeakDataTrait<VN: ArrayLength<usize>> {
-    fn insert(&mut self, key: usize, value: HeaplessVec<usize, VN>);
-    fn contains_key(&self, key: usize) -> bool;
-    fn remove(&mut self, key: usize);
-    fn iter_all<F>(&self, f: F)
-    where
-        F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool;
-}
-
-pub struct LeakData<VN: ArrayLength<usize>> {
-    inner: FnvIndexMap<usize, HeaplessVec<usize, VN>, consts::U32768>,
-}
-impl<VN: ArrayLength<usize>> LeakDataTrait<VN> for LeakData<VN> {
-    fn insert(&mut self, key: usize, value: HeaplessVec<usize, VN>) {
-        self.inner.insert(key, value).ok();
-    }
-    fn contains_key(&self, key: usize) -> bool {
-        self.inner.contains_key(&key)
-    }
-    fn remove(&mut self, key: usize) {
-        self.inner.remove(&key);
-    }
-    fn iter_all<F>(&self, mut f: F)
-    where
-        F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool,
-    {
-        for (addr, symbol_address) in self.inner.iter() {
-            if !f(*addr, symbol_address) {
-                break;
-            }
-        }
-    }
-}
-
-impl<VN: ArrayLength<usize>> LeakData<VN> {}
-impl<LDT, VN> LeakTracer<LDT, VN>
-where
-    VN: ArrayLength<usize>,
-    LDT: LeakDataTrait<VN>,
-{
+impl<const STACK_SIZE: usize> LeakTracer<STACK_SIZE> {
     pub const fn new() -> Self {
         LeakTracer {
-            leak_data: OnceCell::new(),
             backtrace_lock: OnceCell::new(),
-            phantom: PhantomData,
+        }
+    }
+    pub fn init(&self) {
+        assert!(STACK_SIZE > 0);
+        self.backtrace_lock.set(Mutex::new(())).ok();
+        unsafe {
+            alloc_internal_init(STACK_SIZE);
         }
     }
 
-    fn new_data() -> Box<LDT> {
-        let alloc_on_heap = Box::<LDT>::new_zeroed();
-        unsafe { alloc_on_heap.assume_init() }
-    }
-    pub fn init(&self) -> usize {
-        self.leak_data.set(Mutex::new(Self::new_data())).ok();
-        self.backtrace_lock.set(Mutex::new(())).ok();
-        std::mem::size_of::<LDT>()
+    extern "C" fn alloc_enum_cb(
+        usr_data: *const c_void,
+        address: usize,
+        size: usize,
+        stack: *const usize,
+    ) -> i32 {
+        let closure: &mut &mut dyn FnMut(usize, usize, &[usize]) -> bool =
+            unsafe { std::mem::transmute(usr_data) };
+
+        let s = unsafe { std::slice::from_raw_parts(stack, STACK_SIZE) };
+        if closure(address, size, s) {
+            1
+        } else {
+            0
+        }
     }
 
-    pub fn now_leaks<F>(&self, f: F)
+    pub fn now_leaks<F>(&self, mut callback: F)
     where
-        F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool,
+        F: FnMut(usize, usize, &[usize]) -> bool,
     {
-        let all = self.alive_now();
-        all.iter_all(f);
+        // https://stackoverflow.com/questions/32270030/how-do-i-convert-a-rust-closure-to-a-c-style-callback
+        let mut cb: &mut dyn FnMut(usize, usize, &[usize]) -> bool = &mut callback;
+        let cb = &mut cb;
+        unsafe {
+            alloc_enum(cb as *const _ as *const c_void, Self::alloc_enum_cb);
+        }
     }
 
-    pub unsafe fn get_symbol_name(&self, addr: usize) -> Option<String> {
+    pub fn get_symbol_name(&self, addr: usize) -> Option<String> {
         let mut ret: Option<String> = None;
         if let Some(locker) = self.backtrace_lock.get() {
             let mut symbol_buf = {
                 // some symbol name really long, so alloc 500 bytes to hold
-                let alloc_on_heap = Box::<HeaplessString<consts::U500>>::new_zeroed();
-                alloc_on_heap.assume_init()
+                let alloc_on_heap = Box::<HeaplessString<500>>::new_zeroed();
+                unsafe { alloc_on_heap.assume_init() }
             };
             let mut got = false;
             let l = locker.lock();
-            backtrace::resolve_unsynchronized(addr as *mut _, |symbol| {
-                // do NOT trigger alloc in closure scope!
-                match symbol.name() {
-                    Some(x) => {
-                        use std::fmt::Write;
-                        write!(&mut symbol_buf, "{}", x).ok();
-                        got = true;
+            unsafe {
+                backtrace::resolve_unsynchronized(addr as *mut _, |symbol| {
+                    // do NOT trigger alloc in closure scope!
+                    match symbol.name() {
+                        Some(x) => {
+                            use std::fmt::Write;
+                            write!(&mut symbol_buf, "{}", x).ok();
+                            got = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            });
+                });
+            }
             drop(l);
             if got {
                 ret = Some(symbol_buf.as_str().to_owned());
@@ -117,72 +99,52 @@ where
         ret
     }
 
-    fn alive_now(&self) -> Box<LDT> {
-        let mut cloned = Self::new_data();
-        if let Some(data) = self.leak_data.get() {
-            let x = data.lock();
-            (*x).iter_all(|addr, vec| {
-                cloned.insert(addr, vec.clone());
-                true
-            });
-        }
-        cloned
-    }
-
     fn alloc_accounting(&self, size: usize, ptr: *mut u8) -> *mut u8 {
-        let locker = if let Some(locker) = self.backtrace_lock.get() {
-            locker
+        let locker = if let Some(l) = self.backtrace_lock.get() {
+            l
         } else {
             return ptr;
         };
-        let mut v = HeaplessVec::new();
-        v.push(size).ok(); // first is size
+        let mut vs = [0usize; STACK_SIZE];
         let l = if cfg!(os = "windows") {
             Some(locker.lock())
         } else {
             None
         };
+        let mut count = 0;
         // On win7 64, it's may cause deadlock, solution is to palce a newer version of dbghelp.dll combined with exe
         unsafe {
             backtrace::trace_unsynchronized(|frame| {
                 let symbol_address = frame.ip();
-                v.push(symbol_address as usize).is_ok()
+                vs[count] = symbol_address as usize;
+                count += 1;
+                if count >= STACK_SIZE {
+                    false
+                } else {
+                    true
+                }
             });
         }
         drop(l);
-        if let Some(data) = self.leak_data.get() {
-            data.lock().insert(ptr as usize, v);
+        unsafe {
+            alloc_internal_alloc(ptr as usize, size, vs.as_ptr());
         }
         ptr
     }
 
     fn dealloc_accounting(&self, ptr: *mut u8) {
-        if let Some(data) = self.leak_data.get() {
-            let mut x = data.lock();
-            if !x.contains_key(ptr as usize) {
-                //println!("got missed {}", ptr as usize);
-            } else {
-                x.remove(ptr as usize);
-            }
+        unsafe {
+            alloc_internal_dealloc(ptr as usize);
         }
     }
 }
 
-unsafe impl<LDT, VN> GlobalAlloc for LeakTracer<LDT, VN>
-where
-    VN: ArrayLength<usize>,
-    LDT: LeakDataTrait<VN>,
-{
+unsafe impl<const STACK_SIZE: usize> GlobalAlloc for LeakTracer<STACK_SIZE> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.alloc_accounting(layout.size(), System.alloc(layout))
     }
 
-    unsafe fn realloc(
-        &self,
-        ptr0: *mut u8,
-        layout: Layout,
-        new_size: usize
-    ) -> *mut u8 {
+    unsafe fn realloc(&self, ptr0: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let ptr = System.realloc(ptr0, layout, new_size);
         if ptr != ptr0 {
             self.dealloc_accounting(ptr0);
@@ -201,37 +163,6 @@ where
 mod tests {
     #[test]
     fn it_works() {
-        use crate::{
-            consts, ArrayLength, FnvIndexMap, HeaplessVec, LeakData, LeakDataTrait, LeakTracer,
-        };
-        let aa = LeakTracer::<LeakData<consts::U10>, _>::new();
-        println!("size: {}", aa.init());
-
-        struct CustomData<VN: ArrayLength<usize>> {
-            inner: FnvIndexMap<usize, HeaplessVec<usize, VN>, consts::U16384>, // --> U16384 is customized
-        }
-        impl<VN: ArrayLength<usize>> LeakDataTrait<VN> for CustomData<VN> {
-            fn insert(&mut self, key: usize, value: HeaplessVec<usize, VN>) {
-                self.inner.insert(key, value).ok();
-            }
-            fn contains_key(&self, key: usize) -> bool {
-                self.inner.contains_key(&key)
-            }
-            fn remove(&mut self, key: usize) {
-                self.inner.remove(&key);
-            }
-            fn iter_all<F>(&self, mut f: F)
-            where
-                F: FnMut(usize, &HeaplessVec<usize, VN>) -> bool,
-            {
-                for (addr, symbol_address) in self.inner.iter() {
-                    if !f(*addr, symbol_address) {
-                        break;
-                    }
-                }
-            }
-        }
-        let bb = LeakTracer::<CustomData<consts::U12>, _>::new();
-        println!("size: {}", bb.init());
+        let aa = crate::LeakTracer::<15>::new();
     }
 }
